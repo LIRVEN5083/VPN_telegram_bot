@@ -1,51 +1,63 @@
-use dotenvy::dotenv;
 use std::env;
-use std::sync::Arc;
-use teloxide::prelude::*;
-use tracing::{error, info};
+use teloxide::{
+    dispatching::{dialogue::{InMemStorage, Dialogue}, UpdateHandler, dialogue},
+    prelude::*,
+    dptree,
+};
 
-pub mod config;
-pub mod handlers;
-pub mod xui;
+mod handlers;
+mod config;
+use config::Config;
 
-use handlers::{handle_callback_queries, handle_commands, Command};
-use xui::XuiClient;
+// Описание стейтов бота
+#[derive(Clone, Default, Debug)]
+pub enum State {
+    #[default]
+    Start,                    // Запуск
+    AwaitText,                // Бот ждет, пока пользователь напишет текст
+    ConfirmText(String),      // Бот получил текст и ждет нажатия кнопки "Подтвердить"
+}
+
+// Хранилище состояний конкретного пользователя
+type MyDialogue = Dialogue<State, InMemStorage<State>>;
+// Это успех выполнения функции
+type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
 async fn main() {
+    // Включаем логирование
     tracing_subscriber::fmt::init();
-    info!("Запуск VPN-бота в модульном режиме...");
-    
-    dotenv().ok();
 
-    let admin_id: i64 = env::var("ADMIN_TELEGRAM_ID")
-        .expect("ADMIN_TELEGRAM_ID не найден в .env")
-        .parse()
-        .expect("ADMIN_TELEGRAM_ID должен быть числом");
+    // инициализации конфигурации
+    let config = Config::load();
 
-    let xui_url = env::var("XUI_URL").expect("XUI_URL не найден в .env");
-    let xui_user = env::var("XUI_LOGIN").expect("XUI_LOGIN не найден в .env");
-    let xui_pass = env::var("XUI_PASSWORD").expect("XUI_PASSWORD не найден в .env");
-    let server_domain = env::var("SERVER_DOMAIN").unwrap_or_else(|_| "127.0.0.1".to_string());
-    
-    let xui = Arc::new(XuiClient::new(xui_url));
-    if let Err(e) = xui.login(&xui_user, &xui_pass).await {
-        error!("Критическая ошибка авторизации в 3x-ui: {}", e);
-        panic!("Бот остановлен. Проверьте правильность логина и пароля в .env");
-    }
-    
-    let bot = Bot::from_env();
+    let bot = Bot::new(config.bot_token);
 
-    let handler = dptree::entry()
-        .branch(Update::filter_message().filter_command::<Command>().endpoint(handle_commands))
-        .branch(Update::filter_callback_query().endpoint(handle_callback_queries));
-
-    info!("Бот успешно авторизовался везде и начинает слушать Telegram!");
-
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![xui, admin_id, server_domain])
+    Dispatcher::builder(bot, schema())
+        .dependencies(dptree::deps![InMemStorage::<State>::new(), config.admin_id])
         .build()
         .dispatch()
         .await;
+}
 
+// схема обработки обновлений
+fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    use dptree::case;
+
+    // Указываем компилятору брать команды и хэндлеры из модуля handlers
+    let command_handler = teloxide::filter_command::<handlers::SimpleCommand, _>()
+        .endpoint(handlers::handle_commands);
+
+    let message_handler = Update::filter_message()
+        .branch(command_handler)
+        .branch(case![State::AwaitText].endpoint(handlers::handle_await_text))
+        .branch(case![State::Start].endpoint(handlers::handle_unknown_message))
+        .branch(case![State::ConfirmText(text)].endpoint(handlers::handle_unknown_message));
+
+    let callback_query_handler = Update::filter_callback_query()
+        .endpoint(handlers::handle_callback_query);
+
+    dialogue::enter::<Update, InMemStorage<State>, State, _>()
+        .branch(message_handler)
+        .branch(callback_query_handler)
 }

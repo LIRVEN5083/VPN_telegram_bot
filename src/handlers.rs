@@ -1,84 +1,90 @@
-use crate::config::InboundSettings;
-use crate::xui::XuiClient;
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::Write;
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup},
     utils::command::BotCommands,
 };
-use tracing::{error, warn};
+use crate::{MyDialogue, HandlerResult, State};
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Доступные команды:")]
-pub enum Command {
-    #[command(description = "Запустить бота")]
+#[command(rename_rule = "lowercase", description = "Available commands:")]
+pub enum SimpleCommand {
+    #[command(description = "Getting started")]
     Start,
-    #[command(description = "Управление моим VPN")]
-    Vpn,
+    #[command(description = "Save the text to a file")]
+    WriteText,
 }
 
 pub async fn handle_commands(
     bot: Bot,
     msg: Message,
-    cmd: Command,
-    admin_id: i64,
-    xui: Arc<XuiClient>,
-) -> ResponseResult<()> {
-    if msg.chat.id.0 != admin_id {
-        bot.send_message(msg.chat.id, "❌ Доступ запрещен.").await?;
-        return Ok(());
-    }
-
-
-    match cmd {
-        Command::Start => {
-            bot.send_message(
-                msg.chat.id,
-                "👋 Привет, админ! Я твой личный менеджер VPN.\nИспользуй команду /vpn для управления ключами.",
-            )
-                .await?;
+    dialogue: MyDialogue,
+    command: SimpleCommand,
+) -> HandlerResult {
+    match command {
+        SimpleCommand::Start => {
+            dialogue.reset().await?;
+            bot.send_message(msg.chat.id, "Hi! Use the /writetext command to start typing text.").await?;
         }
-        Command::Vpn => {
-            bot.send_message(msg.chat.id, "🔍 Запрашиваю данные из 3x-ui...").await?;
+        SimpleCommand::WriteText => {
+            dialogue.update(State::AwaitText).await?;
+            bot.send_message(msg.chat.id, "Recording mode is active. Send me the text you want to record:").await?;
+        }
+    }
+    Ok(())
+}
 
-            match xui.get_inbounds().await {
-                Ok(inbounds) => {
-                    if inbounds.is_empty() {
-                        bot.send_message(msg.chat.id, "📭 В панели пока нет созданных подключений.").await?;
-                        return Ok(());
-                    }
+// Обработка нажатия на инлайн-кнопку
+pub async fn handle_await_text(
+    bot: Bot,
+    msg: Message,
+    dialogue: MyDialogue,
+) -> HandlerResult {
+    if let Some(text) = msg.text() {
+        // Запоминаем текст внутри состояния ConfirmText
+        dialogue.update(State::ConfirmText(text.to_string())).await?;
 
-                    if let Some(inbound) = inbounds.first() {
-                        if let Ok(settings) = serde_json::from_str::<InboundSettings>(&inbound.settings) {
-                            if let Some(client) = settings.clients.first() {
+        // Создаем кнопку подтверждения
+        let button = InlineKeyboardButton::callback("✅ Confirm action", "confirm_action");
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![button]]);
 
-                                let callback_data = format!("regen:{}:{}", inbound.id, client.id);
-                                let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                                    InlineKeyboardButton::callback("🔄 Перегенерировать ссылку", callback_data)
-                                ]]);
+        bot.send_message(msg.chat.id, format!("You entered: \"{}\"\nClick the button below to save it to a file.", text))
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        bot.send_message(msg.chat.id, "Please send just the text.").await?;
+    }
+    Ok(())
+}
 
-                                let info_text = format!(
-                                    "👤 **Ваш VPN профиль**\n\n\
-                                     🔹 **Протокол:** {}\n\
-                                     🔹 **Имя:** `{}`\n\
-                                     🔹 **Текущий UUID:** `{}`\n\
-                                     🔹 **Порт:** `{}`\n\n\
-                                     ⚡ Нажмите кнопку ниже, чтобы сбросить UUID и получить новую ссылку.",
-                                    inbound.protocol, client.email, client.id, inbound.port
-                                );
+// Обработка текста, когда бот находится в состоянии ReceiveText
+pub async fn handle_callback_query(
+    bot: Bot,
+    q: CallbackQuery,
+    dialogue: MyDialogue,
+) -> HandlerResult {
+    if let Some(data) = q.data {
+        if data == "confirm_action" {
+            bot.answer_callback_query(q.id).await?;
 
-                                bot.send_message(msg.chat.id, info_text)
-                                    .parse_mode(ParseMode::MarkdownV2)
-                                    .reply_markup(keyboard)
-                                    .await?;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    bot.send_message(msg.chat.id, "⚠️ Не удалось распарсить пользователей внутри инбаунда.").await?;
-                }
-                Err(e) => {
-                    bot.send_message(msg.chat.id, format!("❌ Ошибка API: {}", e)).await?;
+            // Проверяем, действительно ли у пользователя сейчас состояние ConfirmText и достаем оттуда сохраненный текст
+            if let Some(State::ConfirmText(text_to_save)) = dialogue.get().await? {
+
+                // Записываем в файл text.txt
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("text.txt")?;
+
+                writeln!(file, "{}", text_to_save)?;
+
+                if let Some(message) = q.message {
+                    // Возвращаем пользователя в начальное состояние
+                    dialogue.reset().await?;
+
+                    bot.send_message(message.chat.id, "🎉 The text has been successfully verified and saved to a file: text.txt!")
+                        .await?;
                 }
             }
         }
@@ -86,75 +92,8 @@ pub async fn handle_commands(
     Ok(())
 }
 
-pub async fn handle_callback_queries(
-    bot: Bot,
-    q: CallbackQuery,
-    xui: Arc<XuiClient>,
-    admin_id: i64,
-    server_domain: String,
-) -> ResponseResult<()> {
-    if q.from.id.0 as i64 != admin_id {
-        return Ok(());
-    }
-
-
-    if let Some(data) = q.data {
-        if data.starts_with("regen:") {
-            let parts: Vec<&str> = data.split(':').collect();
-            if parts.len() < 3 { return Ok(()); }
-
-            let inbound_id: i64 = parts[1].parse().unwrap_or(0);
-            let old_uuid = parts[2];
-
-            if let Some(msg) = q.message {
-                bot.send_message(msg.chat.id, "🔄 Генерирую новый ключ и обновляю панель...").await?;
-
-                if let Ok(inbounds) = xui.get_inbounds().await {
-                    if let Some(inbound) = inbounds.iter().find(|i| i.id == inbound_id) {
-                        if let Ok(mut settings) = serde_json::from_str::<InboundSettings>(&inbound.settings) {
-                            if let Some(client) = settings.clients.iter_mut().find(|c| c.id == old_uuid) {
-
-                                let new_uuid = uuid::Uuid::new_v4().to_string();
-                                let target_uuid = client.id.clone();
-                                client.id = new_uuid.clone();
-
-                                let updated_client_json = serde_json::json!({
-                                    "id": client.id,
-                                    "email": client.email,
-                                    "flow": client.extra.get("flow").unwrap_or(&serde_json::Value::Null),
-                                    "subId": client.extra.get("subId").unwrap_or(&serde_json::Value::Null),
-                                });
-
-                                match xui.update_client(inbound_id, &target_uuid, updated_client_json).await {
-                                    Ok(_) => {
-                                        let vless_link = format!(
-                                            "vless://{}@{}:{}?type=tcp&security=none#{}",
-                                            new_uuid, server_domain, inbound.port, inbound.remark
-                                        );
-
-                                        let success_text = format!(
-                                            "✅ **Успешно перегенерировано!**\n\n\
-                                             🔑 **Новый UUID:** `{}`\n\n\
-                                             📋 **Ваша новая ссылка (нажмите, чтобы скопировать):**\n`{}`",
-                                            new_uuid, vless_link
-                                        );
-
-                                        bot.send_message(msg.chat.id, success_text)
-                                            .parse_mode(ParseMode::MarkdownV2)
-                                            .await?;
-                                    }
-                                    Err(e) => {
-                                        bot.send_message(msg.chat.id, format!("❌ Не удалось обновить в панели: {}", e)).await?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    bot.answer_callback_query(q.id).await?;
+// Заглушка
+pub async fn handle_unknown_message(bot: Bot, msg: Message) -> HandlerResult {
+    bot.send_message(msg.chat.id, "Use command /writetext to write your text.").await?;
     Ok(())
 }
