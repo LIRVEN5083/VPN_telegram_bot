@@ -7,6 +7,8 @@ use teloxide::{
 
 mod handlers;
 mod config;
+mod db;
+
 use config::Config;
 
 // Описание стейтов бота
@@ -30,6 +32,8 @@ async fn main() {
 
     // инициализации конфигурации
     let config = Config::load().await;
+
+    let db_pool = db::init_db("bot_data.db").await;
 
     let bot = Bot::new(config.bot_token);
 
