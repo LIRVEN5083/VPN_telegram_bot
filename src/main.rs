@@ -29,7 +29,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // инициализации конфигурации
-    let config = Config::load();
+    let config = Config::load().await;
 
     let bot = Bot::new(config.bot_token);
 
