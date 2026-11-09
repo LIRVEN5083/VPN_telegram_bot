@@ -40,7 +40,7 @@ impl Config {
         let xui_url = raw_xui_url.trim().trim_end_matches('/').to_string();
         tracing::info!("✅ XUI_URL: successfully loaded ({})", xui_url);
 
-        // Аналог `curl -k`: проверяем, что панель отвечает по указанному URL
+        // Отправляем что-то типо curl и проверяем вообще существует ли адресс
         Self::verify_xui_url(&xui_url).await;
 
         let xui_login = Self::get_required_var("XUI_LOGIN");
@@ -64,8 +64,8 @@ impl Config {
         tracing::info!("🔍 Checking connection to 3x-ui panel...");
 
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true) // Тот самый флаг `-k` (игнорируем самоподписанный SSL)
-            .timeout(Duration::from_secs(5))   // Чтобы бот не завис намертво, если порт закрыт
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_else(|e| {
                 tracing::error!("❌ Failed to build HTTP client: {}", e);
