@@ -1,6 +1,7 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
+use std::path::Path;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct User {
@@ -96,6 +97,27 @@ pub async fn update_last_request(
         .bind(tg_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+// Получить всех пользователей из белого списка
+pub async fn get_whitelisted_users(pool: &SqlitePool) -> Result<Vec<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE is_whitelisted = 1 ORDER BY created_at DESC"
+    )
+        .fetch_all(pool)
+        .await
+}
+
+// Сделать безопасный слепок БД во временный файл
+pub async fn create_backup_file(pool: &SqlitePool, backup_path: &str) -> Result<(), sqlx::Error> {
+    // Удаляем старый временный файл, если он остался от прошлого раза
+    if Path::new(backup_path).exists() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+
+    let query = format!("VACUUM INTO '{}'", backup_path);
+    sqlx::query(&query).execute(pool).await?;
     Ok(())
 }
 
