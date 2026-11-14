@@ -8,6 +8,7 @@ use teloxide::{
 mod handlers;
 mod config;
 mod db;
+mod xui;
 
 use config::Config;
 

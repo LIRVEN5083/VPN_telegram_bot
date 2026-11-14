@@ -1,4 +1,4 @@
-use crate::{db, handlers::user, HandlerResult};
+use crate::{db, handlers::user, xui::XuiClient, HandlerResult};
 use sqlx::SqlitePool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, System};
@@ -9,7 +9,13 @@ use teloxide::{
     },
 };
 
-// Нижнее меню админа
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 pub fn admin_keyboard() -> KeyboardMarkup {
     KeyboardMarkup::new(vec![
         vec![
@@ -116,7 +122,6 @@ pub async fn handle_admin_message(
                     u.tg_id
                 ));
 
-                // Кнопка для быстрого исключения из белого списка
                 buttons.push(vec![InlineKeyboardButton::callback(
                     format!("🗑 Убрать {} ({})", uname, u.tg_id),
                     format!("revoke:{}", u.tg_id),
@@ -144,6 +149,7 @@ pub async fn handle_admin_message(
             }
 
             let mut text_out = String::from("🔑 <b>Ключи и метаданные клиентов:</b>\n\n");
+            let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
 
             for u in users {
                 let uname = u
@@ -155,33 +161,34 @@ pub async fn handle_admin_message(
                 let uuid_str = u
                     .xui_client_uuid
                     .as_deref()
-                    .unwrap_or("<i>не привязан (ожидает 3x-ui)</i>");
-
-                let regen_info = if u.last_key_regen_at == 0 {
-                    "не перевыпускался".to_string()
-                } else {
-                    format!("ts: {}", u.last_key_regen_at)
-                };
+                    .unwrap_or("<i>не выпущен (ожидает нажатия «Мой ключ»)</i>");
 
                 text_out.push_str(&format!(
                     "👤 <b>ID:</b> <code>{}</code> ({})\n\
                      🆔 <b>UUID:</b> <code>{}</code>\n\
-                     🔄 <b>Перевыпуск:</b> {}\n\
-                     📅 <b>В базе с:</b> <code>{}</code>\n\
                      ───────────────\n",
-                    u.tg_id, uname, uuid_str, regen_info, u.created_at
+                    u.tg_id, uname, uuid_str
                 ));
+
+                buttons.push(vec![
+                    InlineKeyboardButton::callback(
+                        format!("🔄 Перевыпустить ({})", u.tg_id),
+                        format!("admin_regen:{}", u.tg_id),
+                    ),
+                    InlineKeyboardButton::callback(
+                        format!("🗑 Удалить ключ ({})", u.tg_id),
+                        format!("admin_delkey:{}", u.tg_id),
+                    ),
+                ]);
             }
 
             bot.send_message(msg.chat.id, text_out)
                 .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(InlineKeyboardMarkup::new(buttons))
                 .await?;
         }
         "💾 Бэкап сейчас" => {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            let ts = now_unix();
             let temp_path = format!("/tmp/vpn_bot_backup_{}.db", ts);
 
             if let Err(e) = db::create_backup_file(&pool, &temp_path).await {
@@ -196,7 +203,6 @@ pub async fn handle_admin_message(
                 .caption("💾 Резервная копия базы данных SQLite")
                 .await?;
 
-            // Удаляем временный файл после отправки
             let _ = std::fs::remove_file(&temp_path);
         }
         _ => {
@@ -213,6 +219,7 @@ pub async fn handle_admin_callback(
     bot: Bot,
     q: CallbackQuery,
     pool: SqlitePool,
+    xui: XuiClient,
 ) -> HandlerResult {
     bot.answer_callback_query(&q.id).await?;
 
@@ -242,7 +249,7 @@ pub async fn handle_admin_callback(
         let _ = bot
             .send_message(
                 ChatId(target_id),
-                "🎉 <b>Ваша заявка одобрена!</b>\nДоступ к VPN открыт. Используйте меню ниже:",
+                "🎉 <b>Ваша заявка одобрена!</b>\nДоступ к VPN открыт. Нажмите <b>«🔑 Мой ключ»</b>, чтобы получить конфигурации:",
             )
             .parse_mode(teloxide::types::ParseMode::Html)
             .reply_markup(user::user_keyboard())
@@ -267,12 +274,19 @@ pub async fn handle_admin_callback(
     } else if let Some(id_str) = data.strip_prefix("revoke:") {
         let target_id: i64 = id_str.parse()?;
 
+        if let Ok(Some(u)) = db::get_user(&pool, target_id).await {
+            if let Some(uuid) = u.xui_client_uuid {
+                let _ = xui.delete_client_all_inbounds(&uuid).await;
+            }
+        }
+
         db::set_whitelist(&pool, target_id, false).await?;
+        db::clear_user_uuid(&pool, target_id).await?;
 
         bot.send_message(
             msg.chat.id,
             format!(
-                "🚫 Пользователь <code>{}</code> <b>удален</b> из белого списка.",
+                "🚫 Пользователь <code>{}</code> <b>удален</b> из белого списка, а его ключи стерты из 3x-ui.",
                 target_id
             ),
         )
@@ -285,7 +299,72 @@ pub async fn handle_admin_callback(
                 "⛔️ Ваш доступ к VPN был отозван администратором.",
             )
             .await;
+    } else if let Some(id_str) = data.strip_prefix("admin_delkey:") {
+        let target_id: i64 = id_str.parse()?;
+
+        if let Ok(Some(u)) = db::get_user(&pool, target_id).await {
+            if let Some(uuid) = u.xui_client_uuid {
+                let _ = xui.delete_client_all_inbounds(&uuid).await;
+                db::clear_user_uuid(&pool, target_id).await?;
+
+                bot.send_message(
+                    msg.chat.id,
+                    format!("🗑 Ключи пользователя <code>{}</code> удалены из 3x-ui.", target_id),
+                )
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            } else {
+                bot.send_message(msg.chat.id, "⚠️ У этого пользователя еще нет активного ключа.")
+                    .await?;
+            }
+        }
+    } else if let Some(id_str) = data.strip_prefix("admin_regen:") {
+        let target_id: i64 = id_str.parse()?;
+
+        if let Ok(Some(u)) = db::get_user(&pool, target_id).await {
+            if let Some(old_uuid) = &u.xui_client_uuid {
+                let _ = xui.delete_client_all_inbounds(old_uuid).await;
+            }
+
+            match xui
+                .provision_user_all_inbounds(target_id, u.username.as_deref())
+                .await
+            {
+                Ok(new_uuid) => {
+                    db::save_user_uuid(&pool, target_id, &new_uuid, now_unix()).await?;
+
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "🔄 Ключи для <code>{}</code> успешно перевыпущены.\nНовый UUID: <code>{}</code>",
+                            target_id, new_uuid
+                        ),
+                    )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+
+                    if let Ok(links) = xui.build_vless_links(&new_uuid).await {
+                        let mut user_msg = String::from(
+                            "🔄 <b>Администратор перевыпустил ваши ключи доступа!</b>\n\
+                             <i>Старые ключи больше не работают. Ваши новые конфигурации:</i>\n\n",
+                        );
+                        for (remark, link) in links {
+                            user_msg.push_str(&format!("🌐 <b>{}</b>\n<code>{}</code>\n\n", remark, link));
+                        }
+                        let _ = bot
+                            .send_message(ChatId(target_id), user_msg)
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("❌ Ошибка перевыпуска: {}", e))
+                        .await?;
+                }
+            }
+        }
     }
 
     Ok(())
 }
+

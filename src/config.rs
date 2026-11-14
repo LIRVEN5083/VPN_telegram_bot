@@ -1,13 +1,14 @@
 use std::env;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub bot_token: String,
     pub admin_id: u64,
     pub xui_url: String,
-    pub xui_login: String,
+    pub xui_username: String,
     pub xui_password: String,
+    pub server_host: String, // Внешний IPv4
 }
 
 impl Config {
@@ -40,14 +41,16 @@ impl Config {
         let xui_url = raw_xui_url.trim().trim_end_matches('/').to_string();
         tracing::info!("✅ XUI_URL: successfully loaded ({})", xui_url);
 
-        // Отправляем что-то типо curl и проверяем вообще существует ли адресс
         Self::verify_xui_url(&xui_url).await;
 
-        let xui_login = Self::get_required_var("XUI_LOGIN");
-        tracing::info!("✅ XUI_LOGIN: successfully loaded ({})", xui_login);
+        let xui_username = Self::get_required_var("XUI_LOGIN");
+        tracing::info!("✅ XUI_LOGIN: successfully loaded ({})", xui_username);
 
         let xui_password = Self::get_required_var("XUI_PASSWORD");
         tracing::info!("✅ XUI_PASSWORD: successfully loaded (********)");
+
+        let server_host = Self::get_required_var("SERVER_IP");
+        tracing::info!("✅ SERVER_IP: successfully loaded ({})", server_host);
 
         tracing::info!("🚀 All parameters verified. Starting the bot...");
 
@@ -55,8 +58,9 @@ impl Config {
             bot_token,
             admin_id,
             xui_url,
-            xui_login,
+            xui_username,
             xui_password,
+            server_host,
         }
     }
 

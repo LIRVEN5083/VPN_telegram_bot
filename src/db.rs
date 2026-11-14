@@ -121,3 +121,29 @@ pub async fn create_backup_file(pool: &SqlitePool, backup_path: &str) -> Result<
     Ok(())
 }
 
+pub async fn save_user_uuid(
+    pool: &SqlitePool,
+    tg_id: i64,
+    uuid: &str,
+    regen_ts: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET xui_client_uuid = ?, last_key_regen_at = ? WHERE tg_id = ?"
+    )
+        .bind(uuid)
+        .bind(regen_ts)
+        .bind(tg_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn clear_user_uuid(pool: &SqlitePool, tg_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET xui_client_uuid = NULL WHERE tg_id = ?")
+        .bind(tg_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+
