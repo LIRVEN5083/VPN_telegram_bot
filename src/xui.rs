@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use std::error::Error;
 
 #[derive(Clone)]
 pub struct XuiClient {
@@ -15,11 +16,11 @@ pub struct XuiClient {
     auth_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Deserialize)]
-struct XuiResponse {
-    success: bool,
-    msg: Option<String>,
-    obj: Option<Value>,
+#[derive(serde::Deserialize, Debug)]
+pub struct XuiResponse {
+    pub success: bool,
+    pub msg: Option<String>,
+    pub obj: Option<serde_json::Value>,
 }
 
 impl XuiClient {
@@ -40,25 +41,74 @@ impl XuiClient {
         }
     }
 
-    pub async fn login(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn login(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _guard = self.auth_lock.lock().await;
         let url = format!("{}/login", self.base_url);
 
-        let resp = self
+        let form_data = [
+            ("username", self.username.as_str()),
+            ("password", self.password.as_str()),
+            ("twoFactorCode", ""),
+        ];
+
+        let response = self
             .http
             .post(&url)
-            .json(&json!({
-                "username": self.username,
-                "password": self.password
-            }))
+            .header("X-Requested-With", "XMLHttpRequest")
+            .form(&form_data)
             .send()
-            .await?
-            .json::<XuiResponse>()
-            .await?;
+            .await
+            .map_err(|e| format!("Network error while connecting to {}: {}", url, e))?;
 
-        if !resp.success {
-            return Err(format!("3x-ui login failed: {:?}", resp.msg).into());
+        let status = response.status();
+
+        let has_session_cookie = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .any(|val| {
+                val.to_str()
+                    .map(|s| s.contains("3x-ui") || s.contains("session"))
+                    .unwrap_or(false)
+            });
+
+        let raw_body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response body (HTTP {}): {}", status, e))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "Server returned HTTP error {} for {}. Response body: {}",
+                status, url, raw_body
+            )
+                .into());
         }
+
+        let parsed: XuiResponse = serde_json::from_str(&raw_body).map_err(|e| {
+            format!(
+                "Failed to parse JSON response from 3x-ui ({}). An HTML page may have been returned. Raw body: {}",
+                e, raw_body
+            )
+        })?;
+
+        if !parsed.success {
+            let reason = parsed.msg.as_deref().unwrap_or("empty error message");
+            return Err(format!(
+                "3x-ui rejected authentication. Reason: '{}'. Full response: {:?}",
+                reason, parsed
+            )
+                .into());
+        }
+
+        if !has_session_cookie {
+            return Err(format!(
+                "Login succeeded (success: true), but no session cookie (Set-Cookie) was returned. Response: {}",
+                raw_body
+            )
+                .into());
+        }
+
         Ok(())
     }
 
