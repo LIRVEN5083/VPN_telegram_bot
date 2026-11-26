@@ -23,9 +23,12 @@ pub struct XuiResponse {
     pub obj: Option<serde_json::Value>,
 }
 
+use reqwest::header::{ORIGIN, REFERER};
+
 impl XuiClient {
     pub fn new(base_url: String, username: String, password: String, server_host: String) -> Self {
         let http = Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
             .build()
@@ -55,6 +58,8 @@ impl XuiClient {
             .http
             .post(&url)
             .header("X-Requested-With", "XMLHttpRequest")
+            .header(ORIGIN, &self.base_url)
+            .header(REFERER, format!("{}/", self.base_url))
             .form(&form_data)
             .send()
             .await
