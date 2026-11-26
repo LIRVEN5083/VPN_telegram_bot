@@ -25,6 +25,12 @@ pub struct XuiResponse {
 
 use reqwest::header::{ORIGIN, REFERER};
 
+#[derive(serde::Deserialize)]
+struct CsrfResponse {
+    success: bool,
+    obj: Option<String>,
+}
+
 impl XuiClient {
     pub fn new(base_url: String, username: String, password: String, server_host: String) -> Self {
         let http = Client::builder()
@@ -46,8 +52,27 @@ impl XuiClient {
 
     pub async fn login(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _guard = self.auth_lock.lock().await;
-        let url = format!("{}/login", self.base_url);
 
+        // 1. Сначала запрашиваем CSRF-токен (панель одновременно запишет сессионную куку в cookie_store)
+        let csrf_url = format!("{}/csrf-token", self.base_url);
+        let csrf_res = self
+            .http
+            .get(&csrf_url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch CSRF token from {}: {}", csrf_url, e))?;
+
+        let csrf_data: CsrfResponse = csrf_res
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse CSRF response: {}", e))?;
+
+        let csrf_token = csrf_data
+            .obj
+            .ok_or("3x-ui did not return a CSRF token in 'obj'")?;
+
+        // 2. Отправляем POST /login с полученным заголовком X-CSRF-Token
+        let url = format!("{}/login", self.base_url);
         let form_data = [
             ("username", self.username.as_str()),
             ("password", self.password.as_str()),
@@ -58,25 +83,13 @@ impl XuiClient {
             .http
             .post(&url)
             .header("X-Requested-With", "XMLHttpRequest")
-            .header(ORIGIN, &self.base_url)
-            .header(REFERER, format!("{}/", self.base_url))
+            .header("X-CSRF-Token", &csrf_token)
             .form(&form_data)
             .send()
             .await
             .map_err(|e| format!("Network error while connecting to {}: {}", url, e))?;
 
         let status = response.status();
-
-        let has_session_cookie = response
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .any(|val| {
-                val.to_str()
-                    .map(|s| s.contains("3x-ui") || s.contains("session"))
-                    .unwrap_or(false)
-            });
-
         let raw_body = response
             .text()
             .await
@@ -92,26 +105,14 @@ impl XuiClient {
 
         let parsed: XuiResponse = serde_json::from_str(&raw_body).map_err(|e| {
             format!(
-                "Failed to parse JSON response from 3x-ui ({}). An HTML page may have been returned. Raw body: {}",
+                "Failed to parse JSON response from 3x-ui ({}). Raw body: {}",
                 e, raw_body
             )
         })?;
 
         if !parsed.success {
             let reason = parsed.msg.as_deref().unwrap_or("empty error message");
-            return Err(format!(
-                "3x-ui rejected authentication. Reason: '{}'. Full response: {:?}",
-                reason, parsed
-            )
-                .into());
-        }
-
-        if !has_session_cookie {
-            return Err(format!(
-                "Login succeeded (success: true), but no session cookie (Set-Cookie) was returned. Response: {}",
-                raw_body
-            )
-                .into());
+            return Err(format!("3x-ui rejected authentication. Reason: '{}'", reason).into());
         }
 
         Ok(())
